@@ -1,52 +1,111 @@
+import os
+import json
+import pickle
 import numpy as np
 from sklearn.ensemble import IsolationForest
-import os
-import pickle
+from sklearn.preprocessing import StandardScaler
 
-#to load or save trained model
+# -----------------------------
+# Paths
+# -----------------------------
+DATA_DIR = "/home/eyerin/projects/ai-nids/data/raw"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "isolation_forest.pkl")
+SCALER_PATH = os.path.join(os.path.dirname(__file__), "scaler.pkl")
 
+# -----------------------------
+# Features (must match collector)
+# -----------------------------
+FEATURE_KEYS = [
+    "failed_login_count",
+    "successful_login_count",
+    "unique_users_attempted",
+    "root_login_attempts",
+    "sudo_command_count",
+    "avg_time_between_logins",
+    "process_spawn_rate",
+    "unique_process_count",
+    "shell_spawn_count",
+    "parent_child_anomaly_score",
+    "background_process_ratio",
+    "orphan_process_count",
+    "long_running_process_count",
+    "encoded_command_ratio",
+    "unique_command_count",
+    "suspicious_command_ratio",
+    "avg_command_length",
+    "pipe_usage_count",
+    "cpu_usage_mean",
+    "cpu_spike_count",
+    "memory_usage_mean",
+    "disk_write_rate",
+    "file_create_count",
+    "file_delete_count",
+    "hidden_file_count",
+    "permission_change_count"
+]
+
+# -----------------------------
+# Train Isolation Forest
+# -----------------------------
 def train(features_list):
-    """
-    Train Isolation Forest on a list of feature dicts.
-    Each element in features_list is a dict of features.
-    """
-    #dict lists->2d array
-    X = np.array([[f["process_spawn_rate"],
-                   f["shell_spawn_count"],
-                   f["orphan_process_count"],
-                   f["long_running_process_count"]] for f in features_list])
-    
-    model = IsolationForest(contamination=0.1, random_state=42)
-    model.fit(X)
+    X = []
+    for f in features_list:
+        row = [float(f.get(k, 0)) for k in FEATURE_KEYS]
+        X.append(row)
+    X = np.array(X)
 
-    #saves model for later use
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    model = IsolationForest(contamination=0.1, random_state=42)
+    model.fit(X_scaled)
+
+    # Save model + scaler
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
-    
+    with open(SCALER_PATH, "wb") as f:
+        pickle.dump(scaler, f)
+
     return model
 
+# -----------------------------
+# Score new data
+# -----------------------------
 def score(features):
-#given a feature dict, returns anomaly score between 0 and 1,1=most anomalous, 0=most normal
-#loads the trained model
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError("Isolation Forest model not found. Train it first with train()")
-    
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
+        raise FileNotFoundError("Train the model first using train()")
+
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
-    
-    X = np.array([[features["process_spawn_rate"],
-                   features["shell_spawn_count"],
-                   features["orphan_process_count"],
-                   features["long_running_process_count"]]])
-    
- # predict returns -1 for anomaly, 1 for normal
-    pred = model.predict(X)[0]
-    # decision_function returns higher = more normal, lower = more anomalous
-    raw_score = model.decision_function(X)[0]
-    
-    # convert to 0-1 anomaly score: 1 = most anomalous
-    anomaly_score = float((1 - model.score_samples(X)[0]) / 2)  # simple normalization
-    if pred == -1:
-        anomaly_score = max(anomaly_score, 0.5)  # make anomalies higher than normal
+    with open(SCALER_PATH, "rb") as f:
+        scaler = pickle.load(f)
+
+    row = [float(features.get(k, 0)) for k in FEATURE_KEYS]
+    X_scaled = scaler.transform([row])
+
+    raw_score = model.decision_function(X_scaled)[0]  # higher = more normal
+    anomaly_score = 1 - (raw_score + 1) / 2
+    anomaly_score = min(max(anomaly_score, 0.0), 1.0)
     return anomaly_score
+
+# -----------------------------
+# Main: score all JSON snapshots
+# -----------------------------
+if __name__ == "__main__":
+    json_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".json")])
+    results = []
+
+    for f in json_files:
+        path = os.path.join(DATA_DIR, f)
+        with open(path) as jf:
+            features = json.load(jf)
+        anomaly = score(features)
+        results.append((f, anomaly))
+
+    # Sort by anomaly descending
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    print("[!] Anomaly scores for all snapshots:")
+    for fname, score_val in results:
+        print(f"{fname}: {score_val:.3f}")
+
